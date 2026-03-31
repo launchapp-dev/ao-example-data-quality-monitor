@@ -1,0 +1,32 @@
+scoring:
+  dimensions:
+    completeness:
+      weight: 30
+      description: "Measures null rates and missing required fields"
+    consistency:
+      weight: 25
+      description: "Measures schema adherence, type consistency, format compliance"
+    accuracy:
+      weight: 25
+      description: "Measures value ranges, distribution normality, outlier rates"
+    timeliness:
+      weight: 20
+      description: "Measures data freshness, update frequency, staleness"
+
+thresholds:
+  healthy: 80
+  degraded: 50
+  critical: 0
+
+null_spike_threshold_pct: 10     # Alert if null % increases by this much from baseline
+distribution_shift_stddev: 2.0   # Alert if mean shifts by this many stddevs from baseline
+volume_change_threshold_pct: 50  # Alert if row count changes by this much from baseline
+
+auto_fix_rules:
+  trim_whitespace: true
+  coerce_numeric_strings: true
+  normalize_date_formats: true
+  fill_defaults:
+    enabled: true
+    max_null_pct: 5              # Only fill defaults if <5% of column is null
+  case_normalization: false       # Too risky by default — requires manual review

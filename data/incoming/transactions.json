@@ -1,0 +1,7 @@
+[
+  {"tx_id": "TX-001", "customer_id": 1001, "amount": 299.99, "currency": "USD", "timestamp": "2026-03-30T14:22:00Z", "status": "completed"},
+  {"tx_id": "TX-002", "customer_id": 1002, "amount": -50.00, "currency": "USD", "timestamp": "2026-03-30T15:01:00Z", "status": "refund"},
+  {"tx_id": "TX-003", "customer_id": 9999, "amount": 150.00, "currency": "EUR", "timestamp": "2026-03-30", "status": "pending"},
+  {"tx_id": null, "customer_id": 1003, "amount": 75.50, "currency": "USD", "timestamp": "2026-03-31T08:00:00Z", "status": "completed"},
+  {"tx_id": "TX-005", "customer_id": 1004, "amount": "1200", "currency": "usd", "timestamp": "2026-03-31T09:15:00Z", "status": "COMPLETED"}
+]

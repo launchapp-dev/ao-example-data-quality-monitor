@@ -1,0 +1,39 @@
+name: inventory
+file_pattern: "inventory*.csv"
+columns:
+  - name: sku
+    type: string
+    required: true
+    unique: true
+    format_regex: "^[A-Z]{2,4}-\\d{4,6}$"
+  - name: product_name
+    type: string
+    required: true
+    min_length: 2
+    max_length: 300
+  - name: category
+    type: string
+    required: true
+    allowed_values: ["electronics", "apparel", "home", "food", "books", "sports", "toys", "automotive"]
+  - name: quantity_on_hand
+    type: integer
+    required: true
+    min: 0
+    max: 100000
+  - name: unit_cost
+    type: float
+    required: true
+    min: 0.01
+    max: 50000
+  - name: reorder_point
+    type: integer
+    required: false
+    min: 0
+    max: 10000
+  - name: last_restock_date
+    type: date
+    required: false
+    format: "YYYY-MM-DD"
+  - name: supplier_id
+    type: string
+    required: false

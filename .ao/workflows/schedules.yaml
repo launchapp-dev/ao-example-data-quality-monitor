@@ -1,0 +1,5 @@
+schedules:
+  - id: hourly-quality-check
+    cron: "0 * * * *"
+    workflow_ref: quality-check
+    enabled: true

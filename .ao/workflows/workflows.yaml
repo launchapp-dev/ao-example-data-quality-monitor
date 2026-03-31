@@ -1,0 +1,33 @@
+default_workflow_ref: quality-check
+
+workflows:
+  - id: quality-check
+    name: "Data Quality Check"
+    description: "Full pipeline: discover files, profile, detect anomalies, apply fixes, generate scorecards"
+    phases:
+      - discover-files
+      - profile-data
+      - normalize-profiles
+      - detect-anomalies
+      - review-anomalies:
+          on_verdict:
+            rework:
+              target: detect-anomalies
+          max_rework_attempts: 2
+      - decide-fixes
+      - apply-fixes
+      - generate-scorecards
+    post_success:
+      merge:
+        strategy: squash
+        target_branch: main
+        create_pr: true
+        auto_merge: true
+        cleanup_worktree: true
+
+  - id: spot-check
+    name: "Spot Check (Single File)"
+    description: "Quick quality check on a single file — pass filename as task title"
+    phases:
+      - profile-single
+      - analyze-single

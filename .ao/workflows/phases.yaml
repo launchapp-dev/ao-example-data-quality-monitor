@@ -1,0 +1,512 @@
+phases:
+  # --- quality-check workflow phases ---
+
+  discover-files:
+    mode: command
+    command:
+      program: python3
+      args: ["-c", "
+import json, os, csv
+from pathlib import Path
+from datetime import datetime
+
+incoming = Path('data/incoming')
+manifest = []
+
+for p in sorted(incoming.iterdir()):
+    if p.suffix not in ('.csv', '.json'):
+        continue
+    stat = p.stat()
+    row_estimate = 0
+    if p.suffix == '.csv':
+        try:
+            with open(p) as f:
+                row_estimate = sum(1 for _ in f) - 1
+        except Exception:
+            row_estimate = -1
+    elif p.suffix == '.json':
+        try:
+            with open(p) as f:
+                data = json.load(f)
+                row_estimate = len(data) if isinstance(data, list) else 1
+        except Exception:
+            row_estimate = -1
+    manifest.append({
+        'path': str(p),
+        'filename': p.name,
+        'format': p.suffix.lstrip('.'),
+        'size_bytes': stat.st_size,
+        'modified_at': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        'row_count_estimate': row_estimate
+    })
+
+os.makedirs('data/pipeline', exist_ok=True)
+with open('data/pipeline/file-manifest.json', 'w') as f:
+    json.dump(manifest, f, indent=2)
+print(f'Discovered {len(manifest)} files')
+for m in manifest:
+    print(f'  {m[\"filename\"]} ({m[\"format\"]}, ~{m[\"row_count_estimate\"]} rows, {m[\"size_bytes\"]} bytes)')
+"]
+      cwd_mode: project_root
+      timeout_secs: 30
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  profile-data:
+    mode: command
+    command:
+      program: python3
+      args: ["-c", "
+import json, csv, re, os, statistics
+from pathlib import Path
+from collections import Counter
+
+def detect_format(values):
+    patterns = {
+        'email': r'^[^@]+@[^@]+\\.[^@]+$',
+        'date_iso': r'^\\d{4}-\\d{2}-\\d{2}$',
+        'date_us': r'^\\d{1,2}/\\d{1,2}/\\d{4}$',
+        'datetime_iso': r'^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}',
+        'phone': r'^[+]?[\\d\\s\\-().]{7,15}$',
+        'url': r'^https?://',
+    }
+    sample = [v for v in values if v][:50]
+    detected = {}
+    for fmt, pat in patterns.items():
+        matches = sum(1 for v in sample if re.match(pat, str(v)))
+        if matches > len(sample) * 0.5:
+            detected[fmt] = round(matches / max(len(sample), 1), 2)
+    return detected
+
+def profile_csv(path):
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    if not rows:
+        return {'error': 'empty_file', 'row_count': 0}
+    columns = {}
+    for col in rows[0].keys():
+        vals = [r.get(col, '') for r in rows]
+        non_null = [v for v in vals if v is not None and str(v).strip() != '']
+        null_count = len(vals) - len(non_null)
+        numeric_vals = []
+        for v in non_null:
+            try:
+                numeric_vals.append(float(str(v).strip().replace(',', '')))
+            except (ValueError, TypeError):
+                pass
+        col_stat = {
+            'null_count': null_count,
+            'null_pct': round(null_count / max(len(vals), 1) * 100, 2),
+            'unique_count': len(set(str(v) for v in non_null)),
+            'sample_values': [str(v) for v in non_null[:5]],
+            'detected_formats': detect_format(non_null),
+        }
+        if numeric_vals:
+            col_stat['numeric'] = {
+                'min': min(numeric_vals),
+                'max': max(numeric_vals),
+                'mean': round(statistics.mean(numeric_vals), 4),
+                'stdev': round(statistics.stdev(numeric_vals), 4) if len(numeric_vals) > 1 else 0,
+            }
+        else:
+            lengths = [len(str(v)) for v in non_null]
+            if lengths:
+                col_stat['string'] = {
+                    'min_length': min(lengths),
+                    'max_length': max(lengths),
+                    'mean_length': round(statistics.mean(lengths), 1),
+                }
+        columns[col] = col_stat
+    seen = set()
+    dup_count = 0
+    for r in rows:
+        key = tuple(r.values())
+        if key in seen:
+            dup_count += 1
+        seen.add(key)
+    import hashlib
+    fp = hashlib.md5(','.join(rows[0].keys()).encode()).hexdigest()[:12]
+    return {'row_count': len(rows), 'column_count': len(columns), 'columns': columns,
+            'duplicate_row_count': dup_count, 'schema_fingerprint': fp}
+
+def profile_json(path):
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        data = [data]
+    if not data:
+        return {'error': 'empty_file', 'row_count': 0}
+    all_keys = Counter()
+    key_types = {}
+    for rec in data:
+        if isinstance(rec, dict):
+            for k, v in rec.items():
+                all_keys[k] += 1
+                t = type(v).__name__ if v is not None else 'null'
+                key_types.setdefault(k, Counter())[t] += 1
+    columns = {}
+    for k, count in all_keys.items():
+        null_count = len(data) - count + key_types.get(k, {}).get('null', 0)
+        type_dist = dict(key_types.get(k, {}))
+        sample_vals = [str(rec.get(k, '')) for rec in data[:5] if isinstance(rec, dict)]
+        non_null_vals = [rec.get(k) for rec in data if isinstance(rec, dict) and rec.get(k) is not None]
+        col_stat = {
+            'null_count': null_count,
+            'null_pct': round(null_count / max(len(data), 1) * 100, 2),
+            'type_distribution': type_dist,
+            'sample_values': sample_vals,
+            'detected_formats': detect_format([str(v) for v in non_null_vals if v]),
+        }
+        numeric_vals = [v for v in non_null_vals if isinstance(v, (int, float))]
+        if numeric_vals:
+            col_stat['numeric'] = {
+                'min': min(numeric_vals),
+                'max': max(numeric_vals),
+                'mean': round(statistics.mean(numeric_vals), 4),
+            }
+        columns[k] = col_stat
+    import hashlib
+    fp = hashlib.md5(','.join(sorted(all_keys.keys())).encode()).hexdigest()[:12]
+    return {'row_count': len(data), 'column_count': len(columns), 'columns': columns,
+            'duplicate_row_count': 0, 'schema_fingerprint': fp}
+
+with open('data/pipeline/file-manifest.json') as f:
+    manifest = json.load(f)
+
+os.makedirs('data/pipeline/profiles', exist_ok=True)
+summary = []
+for entry in manifest:
+    path = Path(entry['path'])
+    try:
+        if entry['format'] == 'csv':
+            profile = profile_csv(path)
+        else:
+            profile = profile_json(path)
+        profile['filename'] = entry['filename']
+        profile['format'] = entry['format']
+        profile['size_bytes'] = entry['size_bytes']
+        profile['modified_at'] = entry['modified_at']
+        out_path = f'data/pipeline/profiles/{entry[\"filename\"]}.json'
+        with open(out_path, 'w') as f:
+            json.dump(profile, f, indent=2)
+        summary.append({'filename': entry['filename'], 'status': 'ok', 'row_count': profile.get('row_count', 0)})
+        print(f'Profiled {entry[\"filename\"]}: {profile.get(\"row_count\", 0)} rows, {profile.get(\"column_count\", 0)} columns')
+    except Exception as e:
+        summary.append({'filename': entry['filename'], 'status': 'error', 'error': str(e)})
+        print(f'ERROR profiling {entry[\"filename\"]}: {e}')
+
+with open('data/pipeline/profiles/summary.json', 'w') as f:
+    json.dump({'files': summary, 'total': len(manifest), 'ok': sum(1 for s in summary if s['status'] == 'ok')}, f, indent=2)
+print('Profiling complete.')
+"]
+      cwd_mode: project_root
+      timeout_secs: 60
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  normalize-profiles:
+    mode: agent
+    agent: profiler
+    directive: |
+      Read all profile JSON files from data/pipeline/profiles/ (skip summary.json).
+      Load expected schemas from config/schemas/ to understand what each data file should look like.
+      Load thresholds from config/quality-config.yaml.
+
+      For each profiled file, produce data/pipeline/findings/{filename}.json with:
+      - schema_check: compare columns found vs expected schema (from matching config/schemas/*.yaml by file_pattern)
+      - null_report: list columns with nulls, their pct, whether above null_spike_threshold_pct
+      - value_ranges: for numeric columns, check against schema min/max if defined
+      - format_violations: for columns with declared format (email, date, etc.), list rows that don't match
+      - duplicates: { duplicate_row_count, total_rows, duplicate_pct }
+      - schema_fingerprint: the fingerprint string from the profile
+
+      After processing all files, write data/pipeline/findings/summary.json:
+      { "files": [{ "filename", "schema_matched", "total_issues", "null_columns", "format_violations", "value_range_violations" }] }
+
+      Use filesystem MCP to read and write all files.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  detect-anomalies:
+    mode: agent
+    agent: anomaly-detector
+    directive: |
+      You are performing the DETECT ANOMALIES step.
+
+      1. Read data/pipeline/findings/ for all finding files (skip summary.json)
+      2. Read data/pipeline/profiles/ for matching profile files
+      3. Query memory MCP for stored entities of type "data_baseline" - look for baselines keyed by each filename
+      4. For each file, compare current stats against baseline (if available):
+         - Null spike: current null_pct > baseline null_pct + 10 (use config threshold)
+         - Distribution shift: abs(current_mean - baseline_mean) > 2 * baseline_stdev
+         - Schema drift: current schema_fingerprint != baseline schema_fingerprint
+         - Volume anomaly: abs(current_row_count - baseline_row_count) / baseline_row_count > 0.5
+      5. If no baseline exists, mark it as first_run and treat everything as informational
+      6. Write per-file anomaly report to data/pipeline/anomalies/{filename}.json:
+         { "filename", "severity": "healthy|degraded|critical", "first_run": bool, "anomalies": [{ "type", "severity", "column", "description", "current_value", "baseline_value", "delta" }] }
+      7. Store current run's null_pcts, means, row_count, schema_fingerprint as new baseline in memory MCP
+         Entity name: "baseline_{filename}", type: "data_baseline", observations: [key stats]
+
+      Output a verdict with: verdict (healthy|degraded|critical), reasoning, anomalies count.
+    decision_contract:
+      required_fields: [verdict, reasoning]
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  review-anomalies:
+    mode: agent
+    agent: anomaly-detector
+    directive: |
+      You are performing the REVIEW ANOMALIES step — a self-check on the anomaly detection output.
+
+      1. Read data/pipeline/file-manifest.json to get the full list of expected files
+      2. Read data/pipeline/anomalies/ to see what anomaly files were produced
+      3. Check for issues:
+         - Are there anomaly files for ALL files in the manifest?
+         - Do severity levels make sense? (e.g., a file with no issues should not be "critical")
+         - Are there any impossible combinations? (e.g., schema_drift detected but no fingerprint change logged)
+         - Are any anomaly objects missing required fields (type, severity, description)?
+      4. If everything looks correct: verdict "approve"
+      5. If you find a genuine problem: verdict "rework" with clear explanation of what needs to be re-run
+
+      Be the quality gate for your own work. A false approve is worse than a false rework.
+    decision_contract:
+      required_fields: [verdict, reasoning]
+
+  decide-fixes:
+    mode: agent
+    agent: anomaly-detector
+    directive: |
+      You are performing the DECIDE FIXES step.
+
+      Read data/pipeline/anomalies/ for all anomaly reports.
+      Read config/quality-config.yaml for auto_fix_rules.
+
+      For each anomaly across all files, classify a fix action:
+      - auto-fix: ONLY for: whitespace trimming, numeric string coercion ("123" -> 123, "N/A" -> null),
+        date format normalization (MM/DD/YYYY -> YYYY-MM-DD), filling defaults when null_pct < 5%
+      - manual-review: ambiguous type coercions, null blocks > 20 rows, business-rule dependent values
+      - escalate: schema drift (new/removed columns), >20% estimated data loss, security-sensitive fields
+
+      Write data/pipeline/fix-plan.json as an array:
+      [{ "file", "column", "fix_action": "auto-fix|manual-review|escalate", "fix_type": "trim_whitespace|coerce_numeric_string|normalize_date|fill_default",
+         "description", "estimated_rows_affected", "reason", "escalation_contact" (if escalate) }]
+
+      Also emit a summary: total fixes by category, files requiring manual attention.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  apply-fixes:
+    mode: agent
+    agent: fixer
+    directive: |
+      Read data/pipeline/fix-plan.json and apply all fixes where fix_action is "auto-fix".
+
+      For each auto-fix item:
+      1. Read the source file from data/incoming/
+      2. Apply ONLY the listed fix_type transformation to the specified column
+      3. Write the result to data/fixed/{filename} (create directory if needed)
+      4. Log every changed cell to data/pipeline/fix-log.json
+
+      Fix types to implement:
+      - trim_whitespace: strip leading/trailing whitespace from string values in the column
+      - coerce_numeric_string: convert string "123" -> 123, "123.45" -> 123.45, "N/A"/"none"/"null"/"" -> null
+      - normalize_date: convert "MM/DD/YYYY" -> "YYYY-MM-DD", ensure datetime strings are ISO 8601
+      - fill_default: replace null/empty with the default value IF the column null_pct is <5%
+
+      Fix log format (append all entries, then write):
+      { "entries": [{ "file", "row_index", "column", "old_value", "new_value", "fix_type", "timestamp" }],
+        "summary": { "total_changes", "by_file": {}, "by_fix_type": {} } }
+
+      If any file is missing from data/incoming/, log a warning entry and skip it.
+      If a fix would affect more rows than estimated_rows_affected * 1.1, stop and write a warning.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+      requires_commit: false
+
+  generate-scorecards:
+    mode: agent
+    agent: reporter
+    directive: |
+      Generate quality scorecards and the pipeline dashboard.
+
+      Read:
+      - data/pipeline/findings/ (per-file findings)
+      - data/pipeline/anomalies/ (per-file anomaly reports)
+      - data/pipeline/fix-log.json (applied fixes)
+      - data/pipeline/fix-plan.json (all fix decisions)
+      - config/quality-config.yaml (scoring weights and thresholds)
+
+      For each data file (match findings to anomalies by filename), write output/scorecards/{filename}.md:
+      - Header with filename and run timestamp
+      - Overall score badge (format: "Overall Score: XX/100 — Healthy/Degraded/Critical")
+      - Dimension score table (completeness/consistency/accuracy/timeliness)
+      - Anomalies section: each anomaly with severity emoji (🔴 critical, 🟠 high, 🟡 medium, 🟢 low)
+      - Fixes Applied section: each change with old -> new example
+      - Manual Review Required section (from fix-plan escalations and manual-review items)
+      - Trend section: retrieve past scores from memory MCP (entity type "quality_run"), show last 3 runs
+
+      Write output/dashboard.md:
+      - Title and run timestamp
+      - Summary table: Filename | Score | Status | Anomalies | Auto-Fixes | Needs Review
+      - Aggregate metrics block
+      - Top Issues list (top 5 anomalies by severity across all files)
+      - Trend sparkline per file (use ASCII: ▁▂▃▄▅▆▇█ based on score 0-100 mapping)
+
+      After writing all files, store this run's scores in memory MCP:
+      Entity name: "run_{filename}_{timestamp}", type: "quality_run"
+      Observations: ["score:{score}", "status:{status}", "anomaly_count:{n}", "timestamp:{iso}"]
+
+      Create output/ and output/scorecards/ directories if they don't exist.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+      requires_commit: true
+
+  # --- spot-check workflow phases ---
+
+  profile-single:
+    mode: command
+    command:
+      program: python3
+      args: ["-c", "
+import json, csv, re, os, statistics
+from pathlib import Path
+from collections import Counter
+import sys
+
+target = '{{subject_title}}'
+# Strip path prefix if user provided full path
+target = Path(target).name
+
+incoming = Path('data/incoming')
+path = incoming / target
+
+if not path.exists():
+    print(f'ERROR: File not found: {path}')
+    sys.exit(1)
+
+def detect_format(values):
+    patterns = {
+        'email': r'^[^@]+@[^@]+\\.[^@]+$',
+        'date_iso': r'^\\d{4}-\\d{2}-\\d{2}$',
+        'date_us': r'^\\d{1,2}/\\d{1,2}/\\d{4}$',
+        'datetime_iso': r'^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}',
+        'phone': r'^[+]?[\\d\\s\\-().]{7,15}$',
+    }
+    sample = [v for v in values if v][:50]
+    detected = {}
+    for fmt, pat in patterns.items():
+        matches = sum(1 for v in sample if re.match(pat, str(v)))
+        if matches > len(sample) * 0.5:
+            detected[fmt] = round(matches / max(len(sample), 1), 2)
+    return detected
+
+os.makedirs('data/pipeline/profiles', exist_ok=True)
+stat = path.stat()
+
+if path.suffix == '.csv':
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    columns = {}
+    for col in (rows[0].keys() if rows else []):
+        vals = [r.get(col, '') for r in rows]
+        non_null = [v for v in vals if v is not None and str(v).strip() != '']
+        null_count = len(vals) - len(non_null)
+        numeric_vals = []
+        for v in non_null:
+            try:
+                numeric_vals.append(float(str(v).strip().replace(',', '')))
+            except (ValueError, TypeError):
+                pass
+        col_stat = {
+            'null_count': null_count,
+            'null_pct': round(null_count / max(len(vals), 1) * 100, 2),
+            'unique_count': len(set(str(v) for v in non_null)),
+            'sample_values': [str(v) for v in non_null[:5]],
+            'detected_formats': detect_format(non_null),
+        }
+        if numeric_vals:
+            col_stat['numeric'] = {'min': min(numeric_vals), 'max': max(numeric_vals), 'mean': round(statistics.mean(numeric_vals), 4)}
+        columns[col] = col_stat
+    import hashlib
+    fp = hashlib.md5(','.join(rows[0].keys() if rows else []).encode()).hexdigest()[:12]
+    profile = {'filename': path.name, 'format': 'csv', 'row_count': len(rows), 'column_count': len(columns),
+               'columns': columns, 'duplicate_row_count': 0, 'schema_fingerprint': fp,
+               'size_bytes': stat.st_size, 'modified_at': __import__('datetime').datetime.fromtimestamp(stat.st_mtime).isoformat()}
+else:
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        data = [data]
+    all_keys = Counter()
+    key_types = {}
+    for rec in data:
+        if isinstance(rec, dict):
+            for k, v in rec.items():
+                all_keys[k] += 1
+                t = type(v).__name__ if v is not None else 'null'
+                key_types.setdefault(k, Counter())[t] += 1
+    columns = {}
+    for k, count in all_keys.items():
+        null_count = len(data) - count + key_types.get(k, {}).get('null', 0)
+        non_null_vals = [rec.get(k) for rec in data if isinstance(rec, dict) and rec.get(k) is not None]
+        col_stat = {
+            'null_count': null_count,
+            'null_pct': round(null_count / max(len(data), 1) * 100, 2),
+            'type_distribution': dict(key_types.get(k, {})),
+            'sample_values': [str(v) for v in non_null_vals[:5]],
+            'detected_formats': detect_format([str(v) for v in non_null_vals]),
+        }
+        numeric_vals = [v for v in non_null_vals if isinstance(v, (int, float))]
+        if numeric_vals:
+            col_stat['numeric'] = {'min': min(numeric_vals), 'max': max(numeric_vals), 'mean': round(statistics.mean(numeric_vals), 4)}
+        columns[k] = col_stat
+    import hashlib
+    fp = hashlib.md5(','.join(sorted(all_keys.keys())).encode()).hexdigest()[:12]
+    profile = {'filename': path.name, 'format': 'json', 'row_count': len(data), 'column_count': len(columns),
+               'columns': columns, 'duplicate_row_count': 0, 'schema_fingerprint': fp,
+               'size_bytes': stat.st_size, 'modified_at': __import__('datetime').datetime.fromtimestamp(stat.st_mtime).isoformat()}
+
+out_path = f'data/pipeline/profiles/{path.name}.json'
+with open(out_path, 'w') as f:
+    json.dump(profile, f, indent=2)
+print(f'Profiled {path.name}: {profile[\"row_count\"]} rows, {profile[\"column_count\"]} columns')
+print(f'Profile written to {out_path}')
+"]
+      cwd_mode: project_root
+      timeout_secs: 30
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  analyze-single:
+    mode: agent
+    agent: anomaly-detector
+    directive: |
+      You are performing a SPOT CHECK on a single file: {{subject_title}}
+
+      1. Read the profile from data/pipeline/profiles/{{subject_title}}.json
+      2. Load the matching schema from config/schemas/ (match by file_pattern)
+      3. Query memory MCP for any stored baseline for this file (entity type "data_baseline")
+      4. Analyze for issues: schema violations, null rates, format violations, value ranges, anomalies vs baseline
+      5. Write an inline scorecard directly to output/scorecards/{{subject_title}}.md
+
+      The scorecard should include:
+      - Overall quality score (0-100)
+      - Dimension breakdown table
+      - Issues found (with severity)
+      - Recommended actions
+
+      Also print a summary to stdout for the operator.
+    capabilities:
+      mutates_state: true
+      writes_files: true

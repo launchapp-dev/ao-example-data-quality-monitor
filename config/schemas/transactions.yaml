@@ -1,0 +1,31 @@
+name: transactions
+file_pattern: "transactions*.json"
+columns:
+  - name: tx_id
+    type: string
+    required: true
+    unique: true
+    format_regex: "^TX-\\d{3,}$"
+  - name: customer_id
+    type: integer
+    required: true
+    min: 1
+  - name: amount
+    type: float
+    required: true
+    min: -10000
+    max: 100000
+  - name: currency
+    type: string
+    required: true
+    allowed_values: ["USD", "EUR", "GBP", "JPY", "CAD"]
+    normalize: uppercase
+  - name: timestamp
+    type: datetime
+    required: true
+    format: "ISO8601"
+  - name: status
+    type: string
+    required: true
+    allowed_values: ["pending", "completed", "refund", "failed", "cancelled"]
+    normalize: lowercase
